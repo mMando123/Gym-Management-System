@@ -636,6 +636,28 @@ class DatabaseManager:
 
         return self.update_member(member_id, status="inactive")
 
+    def activate_member(self, member_id: int) -> tuple[bool, str]:
+        """Re-activate a soft-deleted member by setting status to active."""
+
+        return self.update_member(member_id, status="active")
+
+    def activate_all_inactive_members(self) -> tuple[bool, str, int]:
+        """Re-activate all inactive members in one operation."""
+
+        now = _now_dt_str()
+        try:
+            with self.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE members SET status = 'active', updated_at = ? WHERE status = 'inactive'",
+                    (now,),
+                )
+                affected = int(cur.rowcount or 0)
+                conn.commit()
+            return True, "Members activated successfully", affected
+        except Exception as e:
+            return False, f"Error activating members: {e}", 0
+
     def search_members(self, query: str) -> list[dict[str, Any]]:
         """Search members by name, phone, or member code."""
 
@@ -761,6 +783,9 @@ class DatabaseManager:
                 if st is None:
                     return False, "Invalid subscription type", None
 
+                start = datetime.strptime(start_date, config.DATE_FORMAT).date() if start_date else date.today()
+                end = _add_months(start, int(st["duration_months"]))
+
                 try:
                     has_unpaid = cur.execute(
                         """
@@ -778,8 +803,24 @@ class DatabaseManager:
                 except Exception:
                     pass
 
-                start = datetime.strptime(start_date, config.DATE_FORMAT).date() if start_date else date.today()
-                end = _add_months(start, int(st["duration_months"]))
+                # Prevent duplicate/overlapping invoices for the same period.
+                # Allows renewal only when the new period does not overlap (e.g., next day after end_date).
+                try:
+                    overlap = cur.execute(
+                        """
+                        SELECT 1
+                        FROM subscriptions
+                        WHERE member_id = ?
+                          AND status != 'cancelled'
+                          AND NOT (date(end_date) < date(?) OR date(start_date) > date(?))
+                        LIMIT 1
+                        """,
+                        (member_id, start.isoformat(), end.isoformat()),
+                    ).fetchone()
+                    if overlap is not None:
+                        return False, "يوجد اشتراك مسجل لهذا العضو لنفس الفترة", None
+                except Exception:
+                    pass
 
                 now = _now_dt_str()
 
@@ -820,26 +861,30 @@ class DatabaseManager:
                 )
                 subscription_id = int(cur.lastrowid)
 
-                # Create initial payment record
-                receipt = self.generate_receipt_number()
-                cur.execute(
-                    """
-                    INSERT INTO payments
-                        (subscription_id, member_id, amount, payment_method, payment_date,
-                         receipt_number, notes, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                    """,
-                    (
-                        subscription_id,
-                        member_id,
-                        float(amount_paid),
-                        payment_method,
-                        start.isoformat(),
-                        receipt,
-                        created_by,
-                        now,
-                    ),
-                )
+                # Create initial payment record only when there is an actual payment.
+                try:
+                    if float(amount_paid) > 0.01:
+                        receipt = self.generate_receipt_number()
+                        cur.execute(
+                            """
+                            INSERT INTO payments
+                                (subscription_id, member_id, amount, payment_method, payment_date,
+                                 receipt_number, notes, created_by, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                            """,
+                            (
+                                subscription_id,
+                                member_id,
+                                float(amount_paid),
+                                payment_method,
+                                start.isoformat(),
+                                receipt,
+                                created_by,
+                                now,
+                            ),
+                        )
+                except Exception:
+                    pass
 
                 conn.commit()
                 return True, "Subscription created successfully", subscription_id
@@ -1429,6 +1474,57 @@ class DatabaseManager:
                 return True, "Setting saved"
         except Exception as e:
             return False, f"Error saving setting: {e}"
+
+    def get_app_data_counts(self) -> dict[str, int]:
+        if not self.db_path.exists():
+            return {"members": 0, "subscriptions": 0, "payments": 0, "attendance": 0, "expenses": 0}
+
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+
+            def count_table(name: str) -> int:
+                try:
+                    row = cur.execute(f"SELECT COUNT(*) AS c FROM {name}").fetchone()
+                    return int(row["c"]) if row and row["c"] is not None else 0
+                except Exception:
+                    return 0
+
+            return {
+                "members": count_table("members"),
+                "subscriptions": count_table("subscriptions"),
+                "payments": count_table("payments"),
+                "attendance": count_table("attendance"),
+                "expenses": count_table("expenses"),
+            }
+
+    def wipe_all_app_data(self) -> tuple[bool, str]:
+        if not self.db_path.exists():
+            return False, "Database not found"
+
+        tables = ["payments", "attendance", "subscriptions", "expenses", "members"]
+        try:
+            with self.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA foreign_keys = OFF;")
+
+                for t in tables:
+                    try:
+                        cur.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                try:
+                    seqs = ",".join(["?"] * len(tables))
+                    cur.execute(f"DELETE FROM sqlite_sequence WHERE name IN ({seqs})", tuple(tables))
+                except Exception:
+                    pass
+
+                cur.execute("PRAGMA foreign_keys = ON;")
+                conn.commit()
+
+            return True, "All data deleted"
+        except Exception as e:
+            return False, f"Error deleting data: {e}"
 
 
 if __name__ == "__main__":

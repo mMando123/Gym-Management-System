@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import csv
 import html as html_lib
+import io
 import os
 import tkinter as tk
+import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -31,6 +33,15 @@ from ttkbootstrap.widgets import DateEntry, Meter
 import config
 from database import DatabaseManager
 from utils import format_money, print_html_windows, print_text_windows
+
+try:
+    from PIL import Image, ImageTk
+
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageTk = None
+    PIL_AVAILABLE = False
 
 # Local styling fallback (some modules store COLORS/FONTS locally)
 COLORS = {
@@ -67,6 +78,34 @@ except Exception:
     Figure = None  # type: ignore
     MATPLOTLIB_AVAILABLE = False
 
+if MATPLOTLIB_AVAILABLE:
+    try:
+        from matplotlib.backends import _backend_tk
+
+        if hasattr(_backend_tk, "scroll_event_windows"):
+            _old_mod_scroll = _backend_tk.scroll_event_windows
+
+            def _safe_mod_scroll_event_windows(event):
+                try:
+                    return _old_mod_scroll(event)
+                except Exception:
+                    return "break"
+
+            _backend_tk.scroll_event_windows = _safe_mod_scroll_event_windows
+
+        if hasattr(_backend_tk, "FigureCanvasTk") and hasattr(_backend_tk.FigureCanvasTk, "scroll_event_windows"):
+            _old_scroll_event_windows = _backend_tk.FigureCanvasTk.scroll_event_windows
+
+            def _safe_scroll_event_windows(self, event):
+                try:
+                    return _old_scroll_event_windows(self, event)
+                except Exception:
+                    return "break"
+
+            _backend_tk.FigureCanvasTk.scroll_event_windows = _safe_scroll_event_windows
+    except Exception:
+        pass
+
 # pandas / openpyxl (required in prompt, but guarded)
 try:
     import pandas as pd
@@ -96,7 +135,28 @@ except Exception:
     REPORTLAB_AVAILABLE = False
 
 
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.io as pio
+
+    PLOTLY_AVAILABLE = True
+except Exception:
+    px = None
+    go = None
+    make_subplots = None
+    pio = None
+    PLOTLY_AVAILABLE = False
+
+
 REPORT_CATEGORIES: dict[str, dict[str, Any]] = {
+    "dashboard_cat": {
+        "title": "📊 لوحة التحكم",
+        "reports": {
+            "dashboard": "لوحة التحكم",
+        },
+    },
     "members": {
         "title": "👥 تقارير الأعضاء",
         "reports": {
@@ -162,13 +222,18 @@ class ReportsFrame(tb.Frame):
         self.current_report_meta: dict[str, Any] = {}
         self.charts: list[Any] = []
 
+        self._resize_after_id: str | None = None
+        self._dashboard_data: dict[str, Any] | None = None
+        self._dashboard_layout_mode: str | None = None
+        self._plotly_photo = None
+
         self.configure(padding=10)
 
         self.setup_ui()
         self._bind_shortcuts()
 
         # Default report
-        self.display_report("total_members")
+        self.display_report("dashboard")
 
         self._member_report_types: set[str] = {
             "total_members",
@@ -245,8 +310,12 @@ class ReportsFrame(tb.Frame):
         self.report_content_frame.pack(side="left", fill="both", expand=True)
 
         # Sections inside content
+        self.stats_cards_frame = tb.Frame(self.report_content_frame)
+        self.stats_cards_frame.pack(fill="x", pady=(0, 10))
+
         self.chart_frame = tb.Labelframe(self.report_content_frame, text="📈 الرسم البياني", padding=10)
         self.chart_frame.pack(fill="both", expand=True)
+        self.chart_frame.bind("<Configure>", self._on_chart_resize)
 
         self.table_frame = tb.Labelframe(self.report_content_frame, text="📋 بيانات التقرير", padding=10)
         self.table_frame.pack(fill="both", expand=True, pady=10)
@@ -369,6 +438,11 @@ class ReportsFrame(tb.Frame):
         self.current_report_meta = {}
 
         # Clear previous
+        for w in getattr(self, "stats_cards_frame", self).winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
         for w in self.chart_frame.winfo_children():
             w.destroy()
         for w in self.table_frame.winfo_children():
@@ -378,6 +452,7 @@ class ReportsFrame(tb.Frame):
         start_date, end_date = self._get_date_range()
 
         dispatch = {
+            "dashboard": self.display_dashboard_report,
             "total_members": self.display_total_members_report,
             "new_members": self.display_new_members_report,
             "expired_members": self.display_expired_members_report,
@@ -404,6 +479,456 @@ class ReportsFrame(tb.Frame):
             return
 
         fn(start_date, end_date)
+        self._render_stats_cards()
+
+    def _charts_available(self) -> bool:
+        return bool(PLOTLY_AVAILABLE or MATPLOTLIB_AVAILABLE)
+
+    def _plotly_theme_layout(self, title: str | None = None) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "font": {"family": "Cairo, Arial", "size": 12, "color": COLORS["text"]},
+            "paper_bgcolor": COLORS["background"],
+            "plot_bgcolor": COLORS["white"],
+            "margin": {"l": 30, "r": 30, "t": 55 if title else 30, "b": 30},
+            "legend": {"orientation": "h", "y": -0.12, "x": 1.0, "xanchor": "right"},
+        }
+        if title:
+            base["title"] = {"text": title, "x": 0.98, "xanchor": "right"}
+        return base
+
+    def create_plotly_chart(self, parent: ttk.Widget, fig: Any) -> Any:
+        frame = tb.Frame(parent)
+        frame.pack(fill="both", expand=True)
+
+        top = tb.Frame(frame)
+        top.pack(fill="x", pady=(0, 8))
+        tb.Label(top, text="عرض: صورة داخل البرنامج + زر فتح تفاعلي في المتصفح", font=FONTS["small"], anchor="e").pack(side="right")
+
+        def _open_interactive() -> None:
+            try:
+                cfg = {"responsive": True, "displayModeBar": True, "displaylogo": False}
+                html = fig.to_html(full_html=True, include_plotlyjs="cdn", config=cfg)
+                p = Path(os.getenv("TEMP") or os.getcwd()) / "gms_plotly_dashboard.html"
+                p.write_text(html, encoding="utf-8")
+                try:
+                    os.startfile(str(p))
+                except Exception:
+                    webbrowser.open(p.resolve().as_uri())
+            except Exception as e:
+                messagebox.showerror("خطأ", f"فشل فتح العرض التفاعلي: {e}")
+
+        tb.Button(top, text="فتح تفاعلي", bootstyle="info", command=_open_interactive).pack(side="left")
+
+        if not PLOTLY_AVAILABLE or pio is None:
+            tb.Label(frame, text="Plotly غير متاح", font=FONTS["small"]).pack(fill="both", expand=True, pady=30)
+            return None
+
+        if not PIL_AVAILABLE or Image is None or ImageTk is None:
+            tb.Label(frame, text="Pillow غير متاح لعرض الصورة", font=FONTS["small"]).pack(fill="both", expand=True, pady=30)
+            return None
+
+        try:
+            w = int(parent.winfo_width() or 1000)
+            h = int(parent.winfo_height() or 520)
+        except Exception:
+            w, h = 1000, 520
+
+        w = max(820, int(w) - 20)
+        h = max(420, int(h) - 80)
+
+        try:
+            png_bytes = pio.to_image(fig, format="png", width=w, height=h, scale=2)
+        except Exception:
+            tb.Label(
+                frame,
+                text="لإظهار الرسوم داخل البرنامج يلزم تثبيت kaleido\npython -m pip install kaleido\n(يمكنك استخدام زر فتح تفاعلي الآن)",
+                font=FONTS["small"],
+                anchor="center",
+                justify="center",
+            ).pack(fill="both", expand=True, pady=40)
+            return None
+
+        try:
+            im = Image.open(io.BytesIO(png_bytes))
+            photo = ImageTk.PhotoImage(im)
+            self._plotly_photo = photo
+            lbl = tk.Label(frame, image=photo, bg=COLORS["background"])
+            lbl.pack(fill="both", expand=True)
+            self.charts.append(lbl)
+            return lbl
+        except Exception:
+            tb.Label(frame, text="فشل عرض صورة الرسم", font=FONTS["small"]).pack(fill="both", expand=True, pady=30)
+            return None
+
+    def _on_chart_resize(self, event) -> None:
+        try:
+            if self.current_report_type != "dashboard":
+                return
+        except Exception:
+            return
+
+        w = 0
+        try:
+            w = int(getattr(event, "width", 0) or 0)
+        except Exception:
+            w = 0
+        if w <= 0:
+            return
+
+        mode = "narrow" if w < 720 else "wide"
+        if mode == self._dashboard_layout_mode:
+            return
+
+        try:
+            if self._resize_after_id:
+                self.after_cancel(self._resize_after_id)
+        except Exception:
+            pass
+
+        self._resize_after_id = self.after(220, lambda m=mode: self._render_dashboard_plotly(m))
+
+    def _render_dashboard_plotly(self, mode: str) -> None:
+        if self.current_report_type != "dashboard":
+            return
+        if not (PLOTLY_AVAILABLE and go is not None and make_subplots is not None):
+            return
+        if not self._dashboard_data:
+            return
+
+        for w in self.chart_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        plan_dist = list(self._dashboard_data.get("plan_dist") or [])
+        monthly_revenue = list(self._dashboard_data.get("monthly_revenue") or [])
+        monthly_growth = list(self._dashboard_data.get("monthly_growth") or [])
+        renewal_rate = float(self._dashboard_data.get("renewal_rate") or 0.0)
+
+        if mode == "narrow":
+            fig = make_subplots(
+                rows=4,
+                cols=1,
+                specs=[[{"type": "indicator"}], [{"type": "domain"}], [{"type": "xy"}], [{"type": "xy"}]],
+                vertical_spacing=0.12,
+            )
+            gauge_pos = (1, 1)
+            pie_pos = (2, 1)
+            bar_pos = (3, 1)
+            area_pos = (4, 1)
+        else:
+            fig = make_subplots(
+                rows=2,
+                cols=2,
+                specs=[[{"type": "indicator"}, {"type": "domain"}], [{"type": "xy"}, {"type": "xy"}]],
+                horizontal_spacing=0.10,
+                vertical_spacing=0.18,
+            )
+            gauge_pos = (1, 1)
+            pie_pos = (1, 2)
+            bar_pos = (2, 1)
+            area_pos = (2, 2)
+
+        fig.add_trace(
+            go.Indicator(
+                mode="gauge+number+delta",
+                value=float(renewal_rate),
+                delta={"reference": 70, "suffix": "%"},
+                number={"suffix": "%"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": COLORS["success"] if renewal_rate >= 70 else COLORS["warning"]},
+                    "steps": [
+                        {"range": [0, 50], "color": "#fee2e2"},
+                        {"range": [50, 70], "color": "#fef3c7"},
+                        {"range": [70, 100], "color": "#dcfce7"},
+                    ],
+                },
+                title={"text": "نسبة تجديد الاشتراكات"},
+            ),
+            row=gauge_pos[0],
+            col=gauge_pos[1],
+        )
+
+        p_labels = [p for p, _c in plan_dist][:8]
+        p_values = [int(c) for _p, c in plan_dist][:8]
+        fig.add_trace(
+            go.Pie(labels=p_labels, values=p_values, hole=0.55, textinfo="percent", showlegend=True),
+            row=pie_pos[0],
+            col=pie_pos[1],
+        )
+
+        m_labels = [self._format_month_ym(ym) for ym, _t in monthly_revenue]
+        m_values = [float(t) for _ym, t in monthly_revenue]
+        colors = None
+        try:
+            if px is not None and m_values:
+                vmax = max(m_values) or 1.0
+                colors = [px.colors.sample_colorscale("Blues", float(v) / float(vmax))[0] for v in m_values]
+        except Exception:
+            colors = None
+
+        fig.add_trace(
+            go.Bar(
+                x=m_labels,
+                y=m_values,
+                marker={"color": colors or COLORS["primary"]},
+                name="الإيرادات",
+            ),
+            row=bar_pos[0],
+            col=bar_pos[1],
+        )
+
+        g_labels = [self._format_month_ym(ym) for ym, _c in monthly_growth]
+        g_values = [float(c) for _ym, c in monthly_growth]
+        fig.add_trace(
+            go.Scatter(
+                x=g_labels,
+                y=g_values,
+                mode="lines+markers",
+                fill="tozeroy",
+                line={"color": COLORS["primary"], "width": 3},
+                name="النمو",
+            ),
+            row=area_pos[0],
+            col=area_pos[1],
+        )
+
+        fig.update_layout(**self._plotly_theme_layout(title="لوحة التحكم"))
+        fig.update_xaxes(automargin=True)
+        fig.update_yaxes(automargin=True)
+
+        self._dashboard_layout_mode = mode
+        self.create_plotly_chart(self.chart_frame, fig)
+
+    def display_dashboard_report(self, start_date: str, end_date: str) -> None:
+        self.current_report_title = "لوحة التحكم"
+
+        if self.db is None:
+            self._no_db()
+            return
+
+        ed = self._parse_iso_date(end_date) or date.today()
+        month_start = ed.replace(day=1)
+
+        with self.db.get_connection() as conn:
+            cur = conn.cursor()
+            active_members = int(cur.execute("SELECT COUNT(*) AS c FROM members WHERE status='active'").fetchone()["c"])
+            month_revenue = float(
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) AS total
+                    FROM payments
+                    WHERE date(payment_date) BETWEEN date(?) AND date(?)
+                    """,
+                    (month_start.isoformat(), ed.isoformat()),
+                ).fetchone()["total"]
+                or 0
+            )
+
+            plan_rows = cur.execute(
+                """
+                SELECT st.name_ar AS plan, COUNT(*) AS c
+                FROM subscriptions s
+                JOIN subscription_types st ON st.id = s.subscription_type_id
+                WHERE date(s.start_date) BETWEEN date(?) AND date(?)
+                GROUP BY st.id
+                ORDER BY c DESC
+                """,
+                (start_date, end_date),
+            ).fetchall()
+            plan_dist = [(str(r["plan"]), int(r["c"] or 0)) for r in plan_rows]
+
+            six_months_ago = (month_start - timedelta(days=185)).replace(day=1)
+            rev_rows = cur.execute(
+                """
+                SELECT strftime('%Y-%m', payment_date) AS ym, COALESCE(SUM(amount), 0) AS total
+                FROM payments
+                WHERE date(payment_date) BETWEEN date(?) AND date(?)
+                GROUP BY strftime('%Y-%m', payment_date)
+                ORDER BY ym ASC
+                """,
+                (six_months_ago.isoformat(), ed.isoformat()),
+            ).fetchall()
+            monthly_revenue = [(str(r["ym"]), float(r["total"] or 0)) for r in rev_rows]
+
+            mem_rows = cur.execute(
+                """
+                SELECT strftime('%Y-%m', join_date) AS ym, COUNT(*) AS c
+                FROM members
+                WHERE date(join_date) BETWEEN date(?) AND date(?)
+                GROUP BY strftime('%Y-%m', join_date)
+                ORDER BY ym ASC
+                """,
+                (six_months_ago.isoformat(), ed.isoformat()),
+            ).fetchall()
+            monthly_growth = [(str(r["ym"]), int(r["c"] or 0)) for r in mem_rows]
+
+            rr = cur.execute(
+                """
+                WITH subs AS (
+                    SELECT s.member_id AS member_id,
+                           s.subscription_type_id AS subscription_type_id,
+                           date(s.start_date) AS sd
+                    FROM subscriptions s
+                    WHERE date(s.start_date) BETWEEN date(?) AND date(?)
+                )
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(
+                        CASE
+                            WHEN EXISTS(
+                                SELECT 1
+                                FROM subscriptions s2
+                                WHERE s2.member_id = subs.member_id
+                                  AND s2.subscription_type_id = subs.subscription_type_id
+                                  AND date(s2.end_date) < subs.sd
+                            ) THEN 1 ELSE 0
+                        END
+                    ) AS renewals
+                FROM subs
+                """,
+                (six_months_ago.isoformat(), ed.isoformat()),
+            ).fetchone()
+
+        total_subs = int(rr["total"] or 0) if rr else 0
+        renewals = int(rr["renewals"] or 0) if rr else 0
+        renewal_rate = (float(renewals) / float(total_subs) * 100.0) if total_subs else 0.0
+
+        top_plan = plan_dist[0][0] if plan_dist else "-"
+
+        self.current_report_meta = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "stats_items": [
+                {"label": "الأعضاء النشطون", "value": active_members, "variant": "success"},
+                {"label": "إيرادات الشهر", "value": _fmt_money(month_revenue, db=self.db), "variant": "primary"},
+                {"label": "أكثر باقة", "value": str(top_plan), "variant": "info"},
+                {"label": "نسبة التجديد", "value": f"{renewal_rate:.0f}%", "variant": "warning"},
+            ],
+        }
+
+        self._dashboard_data = {
+            "plan_dist": plan_dist,
+            "monthly_revenue": monthly_revenue,
+            "monthly_growth": monthly_growth,
+            "renewal_rate": renewal_rate,
+        }
+        self._dashboard_layout_mode = None
+
+        if PLOTLY_AVAILABLE and go is not None and make_subplots is not None:
+            w = 0
+            try:
+                w = int(self.chart_frame.winfo_width() or 0)
+            except Exception:
+                w = 0
+            mode = "narrow" if w and w < 720 else "wide"
+            self._render_dashboard_plotly(mode)
+        else:
+            tb.Label(
+                self.chart_frame,
+                text="لعرض لوحة التحكم يلزم تثبيت plotly\npython -m pip install plotly",
+                font=FONTS["small"],
+                anchor="center",
+                justify="center",
+            ).pack(fill="both", expand=True, pady=40)
+
+        columns = ["الشهر", "إجمالي الإيرادات"]
+        table = [[self._format_month_ym(ym), _fmt_money(float(t), db=self.db)] for ym, t in monthly_revenue]
+        self.current_columns = columns
+        self.current_data = table
+        self.create_data_table(self.table_frame, table, columns)
+        self._set_summary(f"إيرادات الشهر: {_fmt_money(month_revenue, db=self.db)} | نسبة التجديد: {renewal_rate:.0f}%")
+
+    def _format_month_ym(self, ym: str) -> str:
+        try:
+            y = ym[:4]
+            m = ym[5:7]
+            return f"{m}/{y}"
+        except Exception:
+            return str(ym)
+
+    def _render_stats_cards(self) -> None:
+        if not hasattr(self, "stats_cards_frame"):
+            return
+
+        for w in self.stats_cards_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        items = []
+        try:
+            items = list(self.current_report_meta.get("stats_items") or [])
+        except Exception:
+            items = []
+
+        if not items:
+            try:
+                if self.current_data:
+                    items = [{"label": "عدد السجلات", "value": len(self.current_data), "variant": "secondary"}]
+            except Exception:
+                items = []
+
+        if not items:
+            return
+
+        container = tb.Frame(self.stats_cards_frame)
+        container.pack(fill="x")
+        for i in range(6):
+            try:
+                container.columnconfigure(i, weight=1)
+            except Exception:
+                pass
+
+        cols = 4 if len(items) >= 4 else max(1, len(items))
+        for i, it in enumerate(items):
+            label = str(it.get("label") or "").strip()
+            value = str(it.get("value") or "-")
+            variant = str(it.get("variant") or "secondary")
+
+            card = tb.Labelframe(container, text=label or "-", padding=10, bootstyle=variant)
+            r = i // cols
+            c = i % cols
+            card.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
+            try:
+                card.columnconfigure(0, weight=1)
+            except Exception:
+                pass
+            tb.Label(card, text=value, font=("Cairo", 16, "bold"), anchor="e").grid(row=0, column=0, sticky="ew")
+
+    def _parse_iso_date(self, s: Any) -> date | None:
+        try:
+            txt = str(s or "").strip()[:10]
+            return datetime.strptime(txt, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    def _fill_daily_series(self, start_date: str, end_date: str, data: list[tuple[Any, Any]]) -> list[tuple[str, float]]:
+        sd = self._parse_iso_date(start_date)
+        ed = self._parse_iso_date(end_date)
+        if sd is None or ed is None:
+            return [(str(k), float(v)) for k, v in data]
+        if ed < sd:
+            sd, ed = ed, sd
+
+        m: dict[str, float] = {}
+        for k, v in data:
+            d = self._parse_iso_date(k)
+            if d is None:
+                continue
+            m[d.isoformat()] = float(v or 0)
+
+        out: list[tuple[str, float]] = []
+        cur = sd
+        while cur <= ed:
+            iso = cur.isoformat()
+            out.append((iso, float(m.get(iso, 0.0))))
+            cur = cur + timedelta(days=1)
+
+        return out
 
     # ------------------------------
     # Report implementations
@@ -462,7 +987,7 @@ class ReportsFrame(tb.Frame):
 
         # Chart
         if MATPLOTLIB_AVAILABLE:
-            data = [(r["d"], int(r["c"])) for r in growth]
+            data = self._fill_daily_series(start_date, end_date, [(r["d"], int(r["c"])) for r in growth])
             self.create_line_chart(self.chart_frame, data, "نمو الأعضاء خلال الفترة", "التاريخ", "عدد المسجلين")
         else:
             tb.Label(self.chart_frame, text="matplotlib غير متاح لعرض الرسوم البيانية", font=FONTS["small"]).pack(pady=30)
@@ -556,9 +1081,10 @@ class ReportsFrame(tb.Frame):
                     """,
                     (start_date, end_date),
                 ).fetchall()
+            filled = self._fill_daily_series(start_date, end_date, [(r["d"], int(r["c"])) for r in series])
             self.create_bar_chart(
                 self.chart_frame,
-                [(r["d"], int(r["c"])) for r in series],
+                [(self._format_date_dmy(str(d)), float(c)) for d, c in filled],
                 "الأعضاء الجدد حسب اليوم",
                 "اليوم",
                 "العدد",
@@ -1608,14 +2134,46 @@ class ReportsFrame(tb.Frame):
 
     def create_line_chart(self, parent: ttk.Widget, data: list[tuple[Any, Any]], title: str, x_label: str, y_label: str):
         fig = Figure(figsize=(8, 3.6), dpi=100)
+        fig.patch.set_facecolor("#ffffff")
         ax = fig.add_subplot(111)
-        x = [r[0] for r in data]
-        y = [r[1] for r in data]
-        ax.plot(x, y, marker="o", linewidth=2, markersize=5, color=COLORS["primary"])
-        ax.set_title(title)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        ax.grid(True, alpha=0.3)
+        ax.set_facecolor("#ffffff")
+
+        if not data:
+            ax.text(0.5, 0.5, "لا توجد بيانات", ha="center", va="center", fontsize=12)
+            ax.set_axis_off()
+        else:
+            x_raw = [r[0] for r in data]
+            y = [float(r[1] or 0) for r in data]
+
+            x_labels: list[str] = []
+            for v in x_raw:
+                d = self._parse_iso_date(v)
+                if d is not None:
+                    x_labels.append(self._format_date_dmy(d.isoformat()))
+                else:
+                    x_labels.append(str(v))
+
+            ax.plot(
+                x_labels,
+                y,
+                marker="o",
+                linewidth=2.4,
+                markersize=6,
+                color=COLORS["primary"],
+                label=y_label or None,
+            )
+            ax.set_title(title)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.grid(True, alpha=0.22)
+            ax.tick_params(axis="x", labelrotation=45)
+            ax.tick_params(axis="y")
+            try:
+                if y_label:
+                    ax.legend(loc="upper left")
+            except Exception:
+                pass
+
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, parent)
@@ -1626,16 +2184,39 @@ class ReportsFrame(tb.Frame):
 
     def create_bar_chart(self, parent: ttk.Widget, data: list[tuple[Any, Any]], title: str, x_label: str, y_label: str):
         fig = Figure(figsize=(8, 3.6), dpi=100)
+        fig.patch.set_facecolor("#ffffff")
         ax = fig.add_subplot(111)
-        labels = [r[0] for r in data]
-        values = [float(r[1]) for r in data]
-        ax.bar(labels, values, color="#3498db")
-        ax.set_title(title)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        ax.grid(True, alpha=0.2, axis="y")
-        if plt is not None:
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+        ax.set_facecolor("#ffffff")
+
+        if not data:
+            ax.text(0.5, 0.5, "لا توجد بيانات", ha="center", va="center", fontsize=12)
+            ax.set_axis_off()
+        else:
+            labels = [str(r[0]) for r in data]
+            values = [float(r[1] or 0) for r in data]
+            bars = ax.bar(labels, values, color=COLORS["primary"], edgecolor="#1e40af", linewidth=0.5)
+            ax.set_title(title)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.grid(True, alpha=0.18, axis="y")
+            ax.tick_params(axis="x", labelrotation=45)
+
+            if len(values) <= 20:
+                for b in bars:
+                    try:
+                        v = float(b.get_height() or 0)
+                        ax.text(
+                            b.get_x() + b.get_width() / 2,
+                            v,
+                            f"{v:.0f}" if abs(v) >= 1 else f"{v:.2f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=9,
+                            color="#111827",
+                        )
+                    except Exception:
+                        pass
+
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, parent)
@@ -1646,11 +2227,36 @@ class ReportsFrame(tb.Frame):
 
     def create_pie_chart(self, parent: ttk.Widget, data: list[tuple[Any, Any]], title: str):
         fig = Figure(figsize=(7, 3.6), dpi=100)
+        fig.patch.set_facecolor("#ffffff")
         ax = fig.add_subplot(111)
-        labels = [r[0] for r in data]
-        values = [float(r[1]) for r in data]
-        ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
-        ax.set_title(title)
+        ax.set_facecolor("#ffffff")
+
+        if not data:
+            ax.text(0.5, 0.5, "لا توجد بيانات", ha="center", va="center", fontsize=12)
+            ax.set_axis_off()
+        else:
+            labels = [str(r[0]) for r in data]
+            values = [float(r[1] or 0) for r in data]
+            palette = [
+                "#2563eb",
+                "#059669",
+                "#d97706",
+                "#7c3aed",
+                "#dc2626",
+                "#0ea5e9",
+                "#64748b",
+            ]
+            ax.pie(
+                values,
+                labels=None,
+                autopct="%1.1f%%",
+                startangle=90,
+                colors=palette[: max(1, len(values))],
+                textprops={"fontsize": 10},
+            )
+            ax.legend(labels, loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
+            ax.set_title(title)
+
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, parent)
@@ -1661,16 +2267,32 @@ class ReportsFrame(tb.Frame):
 
     def create_horizontal_bar_chart(self, parent: ttk.Widget, data: list[tuple[Any, Any]], title: str):
         fig = Figure(figsize=(8, 3.6), dpi=100)
+        fig.patch.set_facecolor("#ffffff")
         ax = fig.add_subplot(111)
-        labels = [r[0] for r in data]
-        values = [float(r[1]) for r in data]
-        y_pos = list(range(len(labels)))
-        ax.barh(y_pos, values, color="#3498db")
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(labels)
-        ax.invert_yaxis()
-        ax.set_title(title)
-        ax.grid(True, alpha=0.2, axis="x")
+        ax.set_facecolor("#ffffff")
+
+        if not data:
+            ax.text(0.5, 0.5, "لا توجد بيانات", ha="center", va="center", fontsize=12)
+            ax.set_axis_off()
+        else:
+            labels = [str(r[0]) for r in data]
+            values = [float(r[1] or 0) for r in data]
+            y_pos = list(range(len(labels)))
+            bars = ax.barh(y_pos, values, color=COLORS["primary"], edgecolor="#1e40af", linewidth=0.5)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels)
+            ax.invert_yaxis()
+            ax.set_title(title)
+            ax.grid(True, alpha=0.18, axis="x")
+
+            if len(values) <= 30:
+                for b in bars:
+                    try:
+                        v = float(b.get_width() or 0)
+                        ax.text(v, b.get_y() + b.get_height() / 2, f" {v:.0f}", va="center", fontsize=9)
+                    except Exception:
+                        pass
+
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, parent)
@@ -1687,11 +2309,24 @@ class ReportsFrame(tb.Frame):
         frame = tb.Frame(parent)
         frame.pack(fill="both", expand=True)
 
-        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        try:
+            style = ttk.Style()
+            style.configure("Reports.Treeview", font=("Cairo", 10), rowheight=26)
+            style.configure("Reports.Treeview.Heading", font=("Cairo", 10, "bold"))
+        except Exception:
+            pass
+
+        tree = ttk.Treeview(frame, columns=columns, show="headings", style="Reports.Treeview")
 
         for col in columns:
             tree.heading(col, text=col)
-            tree.column(col, width=120, anchor="center")
+            tree.column(col, width=140, anchor="e")
+
+        try:
+            tree.tag_configure("odd", background="#ffffff")
+            tree.tag_configure("even", background="#f8fafc")
+        except Exception:
+            pass
 
         ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         xsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
@@ -1701,8 +2336,9 @@ class ReportsFrame(tb.Frame):
         ysb.pack(side="right", fill="y")
         xsb.pack(side="bottom", fill="x")
 
-        for row in data:
-            tree.insert("", "end", values=row)
+        for idx, row in enumerate(data):
+            tag = "even" if (idx % 2 == 0) else "odd"
+            tree.insert("", "end", values=row, tags=(tag,))
 
         return tree
 
@@ -1761,12 +2397,26 @@ class ReportsFrame(tb.Frame):
             return False
 
         try:
-            if PANDAS_AVAILABLE and OPENPYXL_AVAILABLE:
-                df = pd.DataFrame(data, columns=columns)  # type: ignore
-                with pd.ExcelWriter(filename, engine="openpyxl") as writer:  # type: ignore
+            _openpyxl = openpyxl
+            if _openpyxl is None:
+                try:
+                    import openpyxl as _openpyxl  # type: ignore
+                except Exception:
+                    _openpyxl = None
+
+            _pd = pd
+            if _pd is None:
+                try:
+                    import pandas as _pd  # type: ignore
+                except Exception:
+                    _pd = None
+
+            if _pd is not None and _openpyxl is not None:
+                df = _pd.DataFrame(data, columns=columns)  # type: ignore
+                with _pd.ExcelWriter(filename, engine="openpyxl") as writer:  # type: ignore
                     df.to_excel(writer, index=False, sheet_name="التقرير")
-            elif OPENPYXL_AVAILABLE:
-                wb = openpyxl.Workbook()  # type: ignore
+            elif _openpyxl is not None:
+                wb = _openpyxl.Workbook()  # type: ignore
                 ws = wb.active
                 ws.title = "التقرير"
                 ws.append(columns)
@@ -1774,7 +2424,12 @@ class ReportsFrame(tb.Frame):
                     ws.append(list(row))
                 wb.save(filename)
             else:
-                messagebox.showwarning("تنبيه", "openpyxl غير مثبت. استخدم CSV")
+                messagebox.showwarning(
+                    "تنبيه",
+                    "لا يمكن تصدير Excel لأن openpyxl غير مثبت.\n\n"
+                    "لتثبيته: pip install openpyxl\n"
+                    "أو يمكنك اختيار CSV بدون تثبيت إضافي.",
+                )
                 return False
 
             messagebox.showinfo("نجاح", f"تم تصدير التقرير إلى:\n{filename}")
@@ -1797,47 +2452,44 @@ class ReportsFrame(tb.Frame):
         summary: str | None = None,
         filename: str | None = None,
     ) -> bool:
-        if not REPORTLAB_AVAILABLE:
-            if filename is None:
-                filename = filedialog.asksaveasfilename(
-                    defaultextension=".txt",
-                    filetypes=[("Text files", "*.txt")],
-                    title="حفظ التقرير كملف نصي (بديل عن PDF)",
-                )
-            if not filename:
-                return False
+        _rl_colors = None
+        _A4 = None
+        _landscape = None
+        _getSampleStyleSheet = None
+        _SimpleDocTemplate = None
+        _Spacer = None
+        _Table = None
+        _TableStyle = None
+        _Paragraph = None
 
-            if filename.lower().endswith(".pdf"):
-                filename = filename[:-4] + ".txt"
-            if not filename.lower().endswith(".txt"):
-                filename = filename + ".txt"
-
+        if REPORTLAB_AVAILABLE:
+            _rl_colors = rl_colors
+            _A4 = A4
+            _landscape = landscape
+            _getSampleStyleSheet = getSampleStyleSheet
+            _SimpleDocTemplate = SimpleDocTemplate
+            _Spacer = Spacer
+            _Table = Table
+            _TableStyle = TableStyle
+            _Paragraph = Paragraph
+        else:
             try:
-                lines: list[str] = []
-                lines.append(str(getattr(config, "APP_NAME", "")) or "")
-                lines.append(report_title or "")
-                lines.append(f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                if (summary or "").strip():
-                    lines.append("")
-                    lines.append((summary or "").strip())
-                lines.append("")
-                lines.append("\t".join([str(c) for c in columns]))
-                for r in data:
-                    lines.append("\t".join([str(x) for x in r]))
-
-                with open(filename, "w", encoding="utf-8-sig", newline="\r\n") as f:
-                    f.write("\n".join(lines))
-
-                messagebox.showinfo("نجاح", f"تم حفظ التقرير كملف نصي (بديل عن PDF):\n{filename}")
-                try:
-                    if messagebox.askyesno("فتح الملف", "هل تريد فتح الملف الآن؟"):
-                        os.startfile(filename)
-                except Exception:
-                    pass
-
-                return True
-            except Exception as e:
-                messagebox.showerror("خطأ", f"فشل في حفظ التقرير:\n{e}")
+                from reportlab.lib import colors as _rl_colors  # type: ignore
+                from reportlab.lib.pagesizes import A4 as _A4, landscape as _landscape  # type: ignore
+                from reportlab.lib.styles import getSampleStyleSheet as _getSampleStyleSheet  # type: ignore
+                from reportlab.platypus import (  # type: ignore
+                    SimpleDocTemplate as _SimpleDocTemplate,
+                    Spacer as _Spacer,
+                    Table as _Table,
+                    TableStyle as _TableStyle,
+                    Paragraph as _Paragraph,
+                )
+            except Exception:
+                messagebox.showwarning(
+                    "تنبيه",
+                    "لا يمكن تصدير PDF لأن reportlab غير مثبت.\n\n"
+                    "لتثبيته: pip install reportlab",
+                )
                 return False
 
         if filename is None:
@@ -1850,28 +2502,48 @@ class ReportsFrame(tb.Frame):
             return False
 
         try:
-            doc = SimpleDocTemplate(filename, pagesize=landscape(A4), rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-            styles = getSampleStyleSheet()
+            if (
+                _SimpleDocTemplate is None
+                or _landscape is None
+                or _A4 is None
+                or _getSampleStyleSheet is None
+                or _Paragraph is None
+                or _Spacer is None
+                or _Table is None
+                or _TableStyle is None
+                or _rl_colors is None
+            ):
+                raise RuntimeError("PDF export dependencies not available")
+
+            doc = _SimpleDocTemplate(
+                filename,
+                pagesize=_landscape(_A4),
+                rightMargin=30,
+                leftMargin=30,
+                topMargin=30,
+                bottomMargin=30,
+            )
+            styles = _getSampleStyleSheet()
 
             elements = []
-            elements.append(Paragraph(report_title, styles["Title"]))
-            elements.append(Spacer(1, 10))
-            elements.append(Paragraph(f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
-            elements.append(Spacer(1, 10))
+            elements.append(_Paragraph(report_title, styles["Title"]))
+            elements.append(_Spacer(1, 10))
+            elements.append(_Paragraph(f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+            elements.append(_Spacer(1, 10))
             if summary:
-                elements.append(Paragraph(summary, styles["Normal"]))
-                elements.append(Spacer(1, 12))
+                elements.append(_Paragraph(summary, styles["Normal"]))
+                elements.append(_Spacer(1, 12))
 
             table_data = [columns] + data
-            t = Table(table_data)
+            t = _Table(table_data)
             t.setStyle(
-                TableStyle(
+                _TableStyle(
                     [
-                        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#3498db")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+                        ("BACKGROUND", (0, 0), (-1, 0), _rl_colors.HexColor("#3498db")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), _rl_colors.white),
                         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.grey),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f5f5f5")]),
+                        ("GRID", (0, 0), (-1, -1), 0.5, _rl_colors.grey),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_rl_colors.white, _rl_colors.HexColor("#f5f5f5")]),
                     ]
                 )
             )

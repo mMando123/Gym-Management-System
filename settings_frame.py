@@ -103,6 +103,12 @@ class SettingsFrame(tb.Frame):
         self.tab_backup = BackupTab(self.notebook, self.db, self.settings, self.user_data)
         self.notebook.add(self.tab_backup, text="النسخ الاحتياطي")
 
+        if self._is_admin():
+            self.tab_data = DataManagementTab(self.notebook, self.db, self.settings, self.user_data)
+            self.notebook.add(self.tab_data, text="إدارة البيانات")
+        else:
+            self.tab_data = None
+
         self.tab_about = AboutTab(self.notebook, self.db, self.settings, self.user_data)
         self.notebook.add(self.tab_about, text="حول")
 
@@ -118,7 +124,15 @@ class SettingsFrame(tb.Frame):
             except Exception:
                 pass
 
-        for tab in [self.tab_gym, self.tab_system, self.tab_notifications, self.tab_backup, self.tab_about, self.tab_users]:
+        for tab in [
+            self.tab_gym,
+            self.tab_system,
+            self.tab_notifications,
+            self.tab_backup,
+            self.tab_data,
+            self.tab_about,
+            self.tab_users,
+        ]:
             if tab is None:
                 continue
             try:
@@ -200,6 +214,161 @@ class BaseSettingsTab(tb.Frame):
 
     def load(self) -> None:
         return
+
+
+class DataManagementTab(BaseSettingsTab):
+    def __init__(self, parent: ttk.Widget, db: DatabaseManager | None, settings: SettingsManager | None, user_data: dict):
+        super().__init__(parent, db, settings, user_data)
+        self._build()
+        self.load()
+
+    def _build(self) -> None:
+        container = tb.Frame(self, padding=12)
+        container.pack(fill="both", expand=True)
+
+        tb.Label(container, text="🗄️ إدارة البيانات", font=FONTS["subheading"], anchor="e").pack(fill="x")
+
+        danger = tb.Labelframe(container, text="⚠️ منطقة الخطر - Danger Zone", padding=12, bootstyle="danger")
+        danger.pack(fill="x", pady=12)
+
+        title = tb.Label(danger, text="🗑️ حذف جميع البيانات", font=("Cairo", 12, "bold"), anchor="e")
+        title.pack(fill="x")
+
+        tb.Separator(danger).pack(fill="x", pady=8)
+
+        tb.Label(danger, text="سيتم حذف جميع البيانات نهائياً:", anchor="e").pack(fill="x")
+        tb.Label(danger, text="• جميع الأعضاء", anchor="e").pack(fill="x")
+        tb.Label(danger, text="• جميع الاشتراكات", anchor="e").pack(fill="x")
+        tb.Label(danger, text="• جميع سجلات الدفع", anchor="e").pack(fill="x")
+        tb.Label(danger, text="• جميع السجلات المرتبطة", anchor="e").pack(fill="x")
+
+        tb.Label(
+            danger,
+            text="⚠️ تحذير: لا يمكن التراجع عن هذا الإجراء!",
+            foreground=COLORS["danger"],
+            font=("Cairo", 10, "bold"),
+            anchor="e",
+        ).pack(fill="x", pady=(10, 0))
+
+        btn_row = tb.Frame(danger)
+        btn_row.pack(fill="x", pady=(12, 0))
+        tb.Button(btn_row, text="🗑️ حذف جميع البيانات", bootstyle="danger", command=self._start_wipe).pack(side="left")
+
+        tb.Label(
+            container,
+            text="ملاحظة: لن يتم حذف المستخدمين أو إعدادات النظام لتجنب تعطّل تسجيل الدخول.",
+            font=FONTS["small"],
+            foreground=COLORS["text_light"],
+            anchor="e",
+        ).pack(fill="x")
+
+    def load(self) -> None:
+        return
+
+    def _start_wipe(self) -> None:
+        if not self.db:
+            messagebox.showwarning("تنبيه", "قاعدة البيانات غير جاهزة")
+            return
+
+        counts = {}
+        try:
+            counts = self.db.get_app_data_counts()
+        except Exception:
+            counts = {"members": 0, "subscriptions": 0, "payments": 0}
+
+        dlg = tb.Toplevel(self)
+        dlg.title("⚠️ تأكيد الحذف")
+        dlg.geometry("460x300")
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+
+        wrap = tb.Frame(dlg, padding=14)
+        wrap.pack(fill="both", expand=True)
+
+        tb.Label(wrap, text="⚠️ تأكيد الحذف", font=("Cairo", 13, "bold"), anchor="e").pack(fill="x")
+        tb.Label(wrap, text="هل أنت متأكد من حذف جميع البيانات؟", anchor="e").pack(fill="x", pady=(8, 8))
+
+        box = tb.Labelframe(wrap, text="سيتم حذف:", padding=10)
+        box.pack(fill="x")
+
+        tb.Label(box, text=f"• {int(counts.get('members', 0))} أعضاء", anchor="e").pack(fill="x")
+        tb.Label(box, text=f"• {int(counts.get('subscriptions', 0))} اشتراكات", anchor="e").pack(fill="x")
+        tb.Label(box, text=f"• {int(counts.get('payments', 0))} سجل دفع", anchor="e").pack(fill="x")
+
+        btns = tb.Frame(wrap)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def cancel() -> None:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def cont() -> None:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._final_confirm_and_wipe()
+
+        tb.Button(btns, text="إلغاء", bootstyle="secondary", command=cancel).pack(side="right", padx=6)
+        tb.Button(btns, text="متابعة", bootstyle="warning", command=cont).pack(side="right")
+
+    def _final_confirm_and_wipe(self) -> None:
+        if not self.db:
+            return
+
+        dlg = tb.Toplevel(self)
+        dlg.title("🔐 تأكيد نهائي")
+        dlg.geometry("520x280")
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+
+        wrap = tb.Frame(dlg, padding=14)
+        wrap.pack(fill="both", expand=True)
+
+        tb.Label(wrap, text="🔐 تأكيد نهائي", font=("Cairo", 13, "bold"), anchor="e").pack(fill="x")
+        tb.Label(wrap, text='اكتب "حذف الكل" أو "DELETE ALL" للتأكيد:', anchor="e").pack(fill="x", pady=(10, 6))
+
+        var = tk.StringVar(master=dlg, value="")
+        ent = tb.Entry(wrap, textvariable=var, justify="center")
+        ent.pack(fill="x", padx=20, pady=(0, 8))
+        try:
+            ent.focus_set()
+        except Exception:
+            pass
+
+        msg = tb.Label(wrap, text="", foreground=COLORS["danger"], anchor="e")
+        msg.pack(fill="x")
+
+        btns = tb.Frame(wrap)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def cancel() -> None:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def do_delete() -> None:
+            text = (var.get() or "").strip()
+            if text not in {"حذف الكل", "DELETE ALL"}:
+                msg.configure(text="النص غير صحيح")
+                return
+
+            ok, m = self.db.wipe_all_app_data()
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+            if ok:
+                messagebox.showinfo("تم", "تم حذف جميع البيانات بنجاح.\nيفضل إعادة تشغيل التطبيق.")
+            else:
+                messagebox.showerror("خطأ", f"فشل حذف البيانات:\n{m}")
+
+        tb.Button(btns, text="إلغاء", bootstyle="secondary", command=cancel).pack(side="right", padx=6)
+        tb.Button(btns, text="🗑️ حذف نهائي", bootstyle="danger", command=do_delete).pack(side="right")
 
 
 class GymSettingsTab(BaseSettingsTab):

@@ -86,6 +86,12 @@ class MembersFrame(tb.Frame):
         tb.Button(toolbar, text="➕ إضافة عضو جديد", bootstyle="success", command=self.show_add_member_dialog).pack(
             side="right", padx=4
         )
+        self.btn_activate = tb.Button(toolbar, text="✅ تنشيط", bootstyle="success-outline", command=self.activate_selected_member)
+        self.btn_activate.pack(side="right", padx=4)
+        self.btn_activate.configure(state="disabled")
+        tb.Button(toolbar, text="✅ تنشيط الكل", bootstyle="success-outline", command=self.activate_all_inactive_members).pack(
+            side="right", padx=4
+        )
         tb.Button(toolbar, text="✏️ تعديل", bootstyle="info", command=self.edit_selected_member).pack(side="right", padx=4)
         tb.Button(toolbar, text="🗑️ حذف", bootstyle="danger", command=self.delete_selected_member).pack(side="right", padx=4)
         tb.Button(toolbar, text="👁️ عرض", bootstyle="secondary", command=self.view_member_details).pack(side="right", padx=4)
@@ -278,6 +284,7 @@ class MembersFrame(tb.Frame):
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="👁️ عرض", command=self.view_member_details)
         self.context_menu.add_command(label="✏️ تعديل", command=self.edit_selected_member)
+        self.context_menu.add_command(label="✅ تنشيط", command=self.activate_selected_member)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🗑️ حذف", command=self.delete_selected_member)
 
@@ -609,7 +616,74 @@ class MembersFrame(tb.Frame):
         self.apply_filters(reset_page=True)
 
     def on_selection_change(self) -> None:
-        pass
+        try:
+            member_id = self._get_selected_member_id()
+            if member_id is None:
+                self.btn_activate.configure(state="disabled")
+                return
+
+            status_key = None
+            for r in self._all_rows:
+                try:
+                    if int(r.get("id")) == int(member_id):
+                        status_key = str(r.get("status") or "active")
+                        break
+                except Exception:
+                    continue
+
+            if status_key == "inactive":
+                self.btn_activate.configure(state="normal")
+            else:
+                self.btn_activate.configure(state="disabled")
+        except Exception:
+            try:
+                self.btn_activate.configure(state="disabled")
+            except Exception:
+                pass
+
+    def activate_selected_member(self) -> None:
+        if self.db is None:
+            messagebox.showerror("خطأ", "قاعدة البيانات غير جاهزة")
+            return
+
+        member_id = self._get_selected_member_id()
+        if member_id is None:
+            messagebox.showwarning("تنبيه", "يرجى اختيار عضو")
+            return
+
+        member = self.db.get_member_by_id(member_id)
+        if not member:
+            messagebox.showerror("خطأ", "لم يتم العثور على العضو")
+            return
+
+        if str(member.get("status")) != "inactive":
+            messagebox.showinfo("تنبيه", "العضو بالفعل نشط")
+            return
+
+        if not messagebox.askyesno("تأكيد", "هل تريد تنشيط هذا العضو؟"):
+            return
+
+        ok, msg = self.db.activate_member(member_id)
+        if ok:
+            messagebox.showinfo("تم", "تم تنشيط العضو")
+            self.refresh_data()
+        else:
+            messagebox.showerror("خطأ", msg)
+
+    def activate_all_inactive_members(self) -> None:
+        if self.db is None:
+            messagebox.showerror("خطأ", "قاعدة البيانات غير جاهزة")
+            return
+
+        if not messagebox.askyesno("تأكيد", "هل تريد تنشيط جميع الأعضاء غير النشطين؟"):
+            return
+
+        ok, msg, count = self.db.activate_all_inactive_members()
+        if ok:
+            messagebox.showinfo("تم", f"تم تنشيط {count} عضو")
+            self.refresh_data()
+        else:
+            messagebox.showerror("خطأ", msg)
 
     def sort_by_column(self, col: str) -> None:
         if col == "photo":

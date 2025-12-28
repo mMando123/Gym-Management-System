@@ -116,6 +116,30 @@ class SubscriptionsFrame(tb.Frame):
         self.load_subscriptions_data()
         self.check_expiring_subscriptions()
 
+        self._on_show_refreshing: bool = False
+        try:
+            self.bind("<Map>", lambda _e: self._on_show_refresh())
+        except Exception:
+            pass
+
+    def _on_show_refresh(self) -> None:
+        if self.db is None:
+            return
+        if getattr(self, "_on_show_refreshing", False):
+            return
+        self._on_show_refreshing = True
+
+        def run() -> None:
+            try:
+                self.refresh()
+            finally:
+                self._on_show_refreshing = False
+
+        try:
+            self.after(120, run)
+        except Exception:
+            run()
+
     def on_breakpoint_change(self, breakpoint: str) -> None:
         self.breakpoint = breakpoint
         try:
@@ -291,6 +315,7 @@ class SubscriptionsFrame(tb.Frame):
             "sub_id",
             "member_name",
             "phone",
+            "member_status",
             "plan",
             "start_date",
             "end_date",
@@ -303,23 +328,33 @@ class SubscriptionsFrame(tb.Frame):
 
         self.tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="browse")
 
+        try:
+            style = ttk.Style()
+            style.configure("Subscriptions.Treeview", font=("Cairo", 10), rowheight=26)
+            style.configure("Subscriptions.Treeview.Heading", font=("Cairo", 10, "bold"))
+            self.tree.configure(style="Subscriptions.Treeview")
+        except Exception:
+            pass
+
         headers = {
-            "sub_id": ("رقم الاشتراك", 90, "center"),
+            "sub_id": ("#", 55, "center"),
             "member_name": ("اسم العضو", 200, "e"),
-            "phone": ("رقم الهاتف", 120, "center"),
-            "plan": ("نوع الباقة", 110, "center"),
-            "start_date": ("تاريخ البداية", 110, "center"),
-            "end_date": ("تاريخ الانتهاء", 110, "center"),
-            "total_amount": ("المبلغ الكلي", 110, "center"),
-            "paid_amount": ("المدفوع", 90, "center"),
-            "remaining": ("المتبقي", 90, "center"),
+            "phone": ("رقم الهاتف", 115, "center"),
+            "member_status": ("حالة العضو", 95, "center"),
+            "plan": ("نوع الباقة", 85, "center"),
+            "start_date": ("تاريخ البداية", 100, "center"),
+            "end_date": ("تاريخ الانتهاء", 100, "center"),
+            "total_amount": ("الإجمالي", 110, "center"),
+            "paid_amount": ("المدفوع", 110, "center"),
+            "remaining": ("المتبقي", 110, "center"),
             "sub_status": ("حالة الاشتراك", 95, "center"),
-            "pay_status": ("حالة الدفع", 95, "center"),
+            "pay_status": ("حالة الدفع", 85, "center"),
         }
 
         for col, (txt, w, anchor) in headers.items():
             self.tree.heading(col, text=txt)
-            self.tree.column(col, width=w, minwidth=w, anchor=anchor, stretch=False)
+            stretch = col != "sub_id"
+            self.tree.column(col, width=w, minwidth=w, anchor=anchor, stretch=stretch)
 
         self.tree_vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree_hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.tree.xview)
@@ -345,11 +380,12 @@ class SubscriptionsFrame(tb.Frame):
             lambda e: self.cards_canvas.itemconfigure(self.cards_window, width=e.width),
         )
 
-        self.tree.tag_configure("active", background="#dcfce7")
+        self.tree.tag_configure("active", background="#ffffff")
         self.tree.tag_configure("expired", background="#fee2e2")
         self.tree.tag_configure("expiring", background="#fef3c7")
         self.tree.tag_configure("cancelled", background="#e5e7eb")
         self.tree.tag_configure("frozen", background="#e0f2fe")
+        self.tree.tag_configure("member_inactive", background="#fca5a5", foreground="#7f1d1d")
 
         self.tree.bind("<Double-1>", lambda _e: self.view_subscription())
         self.tree.bind("<Return>", lambda _e: self.view_subscription())
@@ -511,6 +547,7 @@ class SubscriptionsFrame(tb.Frame):
                    m.first_name,
                    m.last_name,
                    m.phone,
+                   m.status AS member_status,
                    st.name_ar AS plan_name,
                    st.duration_months,
                    st.price AS plan_price,
@@ -558,10 +595,23 @@ class SubscriptionsFrame(tb.Frame):
 
             total = float(r.get("plan_price") or 0)
             paid = float(r.get("amount_paid") or 0)
-            remaining = total - paid
+            remaining = max(0.0, total - paid)
 
             sub_status_ar, tag = self._subscription_status_ar_and_tag(r, today)
             pay_status_ar = self._payment_status_ar(r)
+
+            ms_raw = str(r.get("member_status") or "active")
+            ms_key = ms_raw.strip().lower()
+            is_active_member = ms_key == "active"
+            ms_ar = {"active": "نشط", "inactive": "غير نشط", "frozen": "مجمد"}.get(ms_key, ms_raw)
+
+            if not is_active_member:
+                sub_status_ar = "غير نشط"
+
+            if not is_active_member:
+                tags = ["member_inactive"]
+            else:
+                tags = [tag]
 
             self.tree.insert(
                 "",
@@ -571,16 +621,17 @@ class SubscriptionsFrame(tb.Frame):
                     r.get("sub_id"),
                     name,
                     phone,
+                    ms_ar,
                     plan,
                     start_date,
                     end_date,
-                    f"{total:,.0f}",
-                    f"{paid:,.0f}",
-                    f"{remaining:,.0f}",
+                    format_money(float(total), db=self.db, decimals=0),
+                    format_money(float(paid), db=self.db, decimals=0),
+                    format_money(float(remaining), db=self.db, decimals=0),
                     sub_status_ar,
                     pay_status_ar,
                 ),
-                tags=(tag,),
+                tags=tuple(tags),
             )
 
     def _render_cards(self) -> None:
@@ -607,7 +658,11 @@ class SubscriptionsFrame(tb.Frame):
             sub_status_ar, _tag = self._subscription_status_ar_and_tag(r, today)
             pay_status_ar = self._payment_status_ar(r)
 
-            card = tb.Frame(self.cards_inner, padding=10, bootstyle="secondary")
+            member_status = str(r.get("member_status") or "active")
+            card_style = "danger" if member_status != "active" else "secondary"
+            if str(member_status).strip().lower() != "active":
+                sub_status_ar = "غير نشط"
+            card = tb.Frame(self.cards_inner, padding=10, bootstyle=card_style)
             card.pack(fill="x", pady=6)
             card.configure(cursor="hand2")
 
@@ -1033,6 +1088,7 @@ class NewSubscriptionDialog(tk.Toplevel):
         self.db = db
         self.user_data = user_data or {}
         self.saved: bool = False
+        self._saving: bool = False
 
         self.title("اشتراك جديد")
         self.geometry("760x620")
@@ -1072,10 +1128,10 @@ class NewSubscriptionDialog(tk.Toplevel):
         btns = tb.Frame(container)
         btns.pack(fill="x", pady=(0, 10))
 
-        tb.Button(btns, text="حفظ الاشتراك", bootstyle="success", command=self._save).pack(side="right", padx=6)
-        tb.Button(btns, text="حفظ وطباعة الإيصال", bootstyle="info", command=lambda: self._save(print_after=True)).pack(
-            side="right", padx=6
-        )
+        self.btn_save = tb.Button(btns, text="حفظ الاشتراك", bootstyle="success", command=self._save)
+        self.btn_save.pack(side="right", padx=6)
+        self.btn_save_print = tb.Button(btns, text="حفظ وطباعة الإيصال", bootstyle="info", command=lambda: self._save(print_after=True))
+        self.btn_save_print.pack(side="right", padx=6)
         tb.Button(btns, text="إلغاء", bootstyle="secondary", command=self.destroy).pack(side="left")
 
         # Member selection
@@ -1314,13 +1370,34 @@ class NewSubscriptionDialog(tk.Toplevel):
         raise ValueError("invalid date")
 
     def _save(self, print_after: bool = False) -> None:
+        if getattr(self, "_saving", False):
+            return
+        self._saving = True
+        try:
+            self.btn_save.configure(state="disabled")
+            self.btn_save_print.configure(state="disabled")
+        except Exception:
+            pass
+
         if self.selected_member is None:
             messagebox.showwarning("تنبيه", "يرجى اختيار عضو")
+            try:
+                self.btn_save.configure(state="normal")
+                self.btn_save_print.configure(state="normal")
+            except Exception:
+                pass
+            self._saving = False
             return
 
         plan = self._selected_plan()
         if not plan:
             messagebox.showwarning("تنبيه", "يرجى اختيار باقة")
+            try:
+                self.btn_save.configure(state="normal")
+                self.btn_save_print.configure(state="normal")
+            except Exception:
+                pass
+            self._saving = False
             return
 
         try:
@@ -1330,6 +1407,12 @@ class NewSubscriptionDialog(tk.Toplevel):
             self.end_var.set(end.isoformat())
         except Exception:
             messagebox.showerror("خطأ", "تواريخ غير صحيحة")
+            try:
+                self.btn_save.configure(state="normal")
+                self.btn_save_print.configure(state="normal")
+            except Exception:
+                pass
+            self._saving = False
             return
 
         try:
@@ -1339,6 +1422,12 @@ class NewSubscriptionDialog(tk.Toplevel):
 
         if paid < 0:
             messagebox.showerror("خطأ", "المبلغ المدفوع غير صحيح")
+            try:
+                self.btn_save.configure(state="normal")
+                self.btn_save_print.configure(state="normal")
+            except Exception:
+                pass
+            self._saving = False
             return
 
         # Note: current DB schema stores only amount_paid; we keep discount/final in notes.
@@ -1355,6 +1444,12 @@ class NewSubscriptionDialog(tk.Toplevel):
 
         if not ok or sub_id is None:
             messagebox.showerror("خطأ", msg)
+            try:
+                self.btn_save.configure(state="normal")
+                self.btn_save_print.configure(state="normal")
+            except Exception:
+                pass
+            self._saving = False
             return
 
         # Add notes if any

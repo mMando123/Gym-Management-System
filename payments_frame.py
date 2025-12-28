@@ -380,7 +380,7 @@ class PaymentsFrame(tb.Frame):
         self.create_layout()
 
         self.load_financial_summary()
-        self.load_payments_data()
+        self.load_payments_data(filters=self._collect_filters())
 
         self._bind_shortcuts()
 
@@ -397,6 +397,7 @@ class PaymentsFrame(tb.Frame):
         self.filter_method_var = tk.StringVar(master=self, value="الكل")
         self.filter_type_var = tk.StringVar(master=self, value="الكل")
         self.filter_search_var = tk.StringVar(master=self, value="")
+        self.filter_show_paid_var = tk.BooleanVar(master=self, value=True)
 
         # Summary vars
         self.today_total_var = tk.StringVar(master=self, value="0")
@@ -414,6 +415,8 @@ class PaymentsFrame(tb.Frame):
         self.quick_amount_var = tk.StringVar(master=self, value="")
         self.quick_method_var = tk.StringVar(master=self, value="cash")
         self.quick_notes_var = tk.StringVar(master=self, value="")
+
+        self._quick_saving: bool = False
 
         self.quick_selected_member: dict[str, Any] | None = None
         self.quick_suggest_var = tk.StringVar(master=self, value="")
@@ -533,6 +536,16 @@ class PaymentsFrame(tb.Frame):
         self.search_entry = tb.Entry(self.filter_controls, textvariable=self.filter_search_var, justify="right")
         self.btn_search = tb.Button(self.filter_controls, text="بحث", bootstyle="secondary", command=self.apply_filters)
 
+        self.show_paid_check = tb.Checkbutton(
+            self.filter_controls,
+            text="إظهار المدفوعة",
+            variable=self.filter_show_paid_var,
+            bootstyle="secondary",
+            command=self.apply_filters,
+        )
+
+        self._lbl_show_paid_spacer = tb.Label(self.filter_controls, text="", font=("Cairo", 10, "bold"))
+
         self.btn_apply = tb.Button(self.filter_controls, text="تطبيق", bootstyle="primary", command=self.apply_filters)
         self.btn_clear = tb.Button(self.filter_controls, text="مسح", bootstyle="secondary", command=self.clear_filters)
 
@@ -640,12 +653,20 @@ class PaymentsFrame(tb.Frame):
                            m.last_name,
                            m.phone,
                            p.subscription_id,
-                           p.created_at
+                           p.created_at,
+                           s.invoice_status AS sub_invoice_status,
+                           s.amount_paid AS sub_amount_paid,
+                           st.price AS sub_total
                     FROM payments p
                     JOIN members m ON m.id = p.member_id
+                    LEFT JOIN subscriptions s ON s.id = p.subscription_id
+                    LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
                     WHERE 1=1
                 """
                 params: list[Any] = []
+
+                # Hide invalid/legacy zero-amount rows to reduce confusion in the list.
+                query += " AND ABS(COALESCE(p.amount, 0)) > 0.01"
 
                 if filters.get("start_date"):
                     query += " AND date(p.payment_date) >= date(?)"
@@ -660,6 +681,10 @@ class PaymentsFrame(tb.Frame):
                     query += " AND ((m.first_name || ' ' || m.last_name) LIKE ? OR p.receipt_number LIKE ?)"
                     s = f"%{filters['search']}%"
                     params.extend([s, s])
+
+                # Default: hide records linked to fully-paid subscriptions to reduce clutter.
+                if not filters.get("show_paid"):
+                    query += " AND (p.subscription_id IS NULL OR COALESCE(s.invoice_status, 'unpaid') != 'paid')"
 
                 query += " ORDER BY datetime(p.created_at) DESC, p.id DESC LIMIT 500"
 
@@ -849,6 +874,7 @@ class PaymentsFrame(tb.Frame):
             self.method_combo,
             self.lbl_type,
             self.type_combo,
+            self.show_paid_check,
             self.lbl_search,
             self.search_entry,
             self.btn_search,
@@ -893,7 +919,7 @@ class PaymentsFrame(tb.Frame):
                 (self.lbl_end, self.end_entry),
                 (self.lbl_method, self.method_combo),
                 (self.lbl_type, self.type_combo),
-                (self.lbl_search, self.search_entry),
+                (self._lbl_show_paid_spacer, self.show_paid_check),
             ]
             for lbl, field in pairs:
                 lbl.grid(row=row, column=1, sticky="e", padx=(0, 6), pady=3)
@@ -925,6 +951,7 @@ class PaymentsFrame(tb.Frame):
         self.method_combo.grid(row=0, column=4, sticky="w", padx=(0, 12), pady=3)
         self.lbl_type.grid(row=0, column=3, sticky="e", padx=(0, 6), pady=3)
         self.type_combo.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=3)
+        self.show_paid_check.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=3)
 
         if not hasattr(self, "_search_row") or not self._search_row.winfo_exists():
             self._search_row = tb.Frame(self.filter_controls)
@@ -956,6 +983,7 @@ class PaymentsFrame(tb.Frame):
             "member",
             "op_type",
             "amount",
+            "remaining",
             "method",
             "received_by",
             "notes",
@@ -970,6 +998,7 @@ class PaymentsFrame(tb.Frame):
             "member": ("اسم العضو", 200, "e"),
             "op_type": ("نوع العملية", 110, "center"),
             "amount": ("المبلغ", 100, "center"),
+            "remaining": ("المتبقي", 100, "center"),
             "method": ("طريقة الدفع", 100, "center"),
             "received_by": ("المستلم", 90, "center"),
             "notes": ("ملاحظات", 220, "e"),
@@ -1010,6 +1039,8 @@ class PaymentsFrame(tb.Frame):
 
         self.tree.tag_configure("refund", foreground=COLORS["danger"])
         self.tree.tag_configure("large", font=("Cairo", 10, "bold"))
+        self.tree.tag_configure("paid_invoice", background="#dcfce7")
+        self.tree.tag_configure("unpaid_invoice", background="#fee2e2")
 
         self.tree.bind("<Double-1>", lambda _e: self.view_selected_receipt())
         self.tree.bind("<Return>", lambda _e: self.view_selected_receipt())
@@ -1201,7 +1232,8 @@ class PaymentsFrame(tb.Frame):
         self.quick_notes_entry.pack(side="right", fill="x", expand=True, padx=(0, 12), ipady=4)
 
         # Save
-        tb.Button(row, text="حفظ", bootstyle="success", command=self.save_quick_payment).pack(side="left", ipady=6, padx=6)
+        self.quick_btn_save = tb.Button(row, text="حفظ", bootstyle="success", command=self.save_quick_payment)
+        self.quick_btn_save.pack(side="left", ipady=6, padx=6)
         tb.Button(row, text="تفاصيل", bootstyle="info", command=self.open_record_payment_dialog).pack(side="left", ipady=6)
 
         self.quick_hint = tb.Label(
@@ -1382,6 +1414,9 @@ class PaymentsFrame(tb.Frame):
         if self.db is None:
             return
 
+        if filters is None:
+            filters = self._collect_filters()
+
         query = """
             SELECT p.id,
                    p.receipt_number,
@@ -1393,12 +1428,21 @@ class PaymentsFrame(tb.Frame):
                    m.first_name,
                    m.last_name,
                    m.phone,
-                   p.subscription_id
+                   p.subscription_id,
+                   p.created_at,
+                   s.invoice_status AS sub_invoice_status,
+                   s.amount_paid AS sub_amount_paid,
+                   st.price AS sub_total
             FROM payments p
             JOIN members m ON m.id = p.member_id
+            LEFT JOIN subscriptions s ON s.id = p.subscription_id
+            LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
             WHERE 1=1
         """
         params: list[Any] = []
+
+        # Hide invalid/legacy zero-amount rows to reduce confusion in the list.
+        query += " AND ABS(COALESCE(p.amount, 0)) > 0.01"
 
         if filters:
             if filters.get("start_date"):
@@ -1414,6 +1458,10 @@ class PaymentsFrame(tb.Frame):
                 query += " AND ((m.first_name || ' ' || m.last_name) LIKE ? OR p.receipt_number LIKE ?)"
                 s = f"%{filters['search']}%"
                 params.extend([s, s])
+
+            # Default: hide records linked to fully-paid subscriptions to reduce clutter.
+            if not filters.get("show_paid"):
+                query += " AND (p.subscription_id IS NULL OR COALESCE(s.invoice_status, 'unpaid') != 'paid')"
 
         query += " ORDER BY datetime(p.created_at) DESC, p.id DESC LIMIT 500"
 
@@ -1453,6 +1501,36 @@ class PaymentsFrame(tb.Frame):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
 
+        remaining_by_payment_id: dict[int, float] = {}
+        sub_rows: dict[int, list[dict[str, Any]]] = {}
+        for r in self._rows:
+            try:
+                sid = r.get("subscription_id")
+                if sid is None:
+                    continue
+                sid_int = int(sid)
+                sub_rows.setdefault(sid_int, []).append(r)
+            except Exception:
+                continue
+
+        for sid, rows in sub_rows.items():
+            try:
+                rows_sorted = sorted(
+                    rows,
+                    key=lambda x: (
+                        str(x.get("payment_date") or x.get("created_at") or ""),
+                        int(x.get("id") or 0),
+                    ),
+                )
+                sub_total = float(rows_sorted[0].get("sub_total") or 0)
+                paid_sum = 0.0
+                for rr in rows_sorted:
+                    paid_sum += float(rr.get("amount") or 0)
+                    pid = int(rr.get("id") or 0)
+                    remaining_by_payment_id[pid] = max(0.0, sub_total - paid_sum)
+            except Exception:
+                continue
+
         for r in self._rows:
             receipt = r.get("receipt_number") or ""
 
@@ -1465,6 +1543,14 @@ class PaymentsFrame(tb.Frame):
             amount = float(r.get("amount") or 0)
             method = self._method_ar(str(r.get("payment_method") or ""))
 
+            remaining_disp = "-"
+            try:
+                pid_int = int(r.get("id") or 0)
+                if pid_int in remaining_by_payment_id:
+                    remaining_disp = _fmt_money(float(remaining_by_payment_id[pid_int]), db=self.db)
+            except Exception:
+                pass
+
             received_by = self._received_by_display(r)
             notes = str(r.get("notes") or "")
 
@@ -1473,6 +1559,19 @@ class PaymentsFrame(tb.Frame):
                 tags.append("refund")
             if abs(amount) >= 500:
                 tags.append("large")
+
+            # Visual status based on linked subscription if available.
+            try:
+                sub_total = float(r.get("sub_total") or 0)
+                sub_paid = float(r.get("sub_amount_paid") or 0)
+                if sub_total > 0:
+                    remaining = sub_total - sub_paid
+                    if remaining <= 0.01:
+                        tags.append("paid_invoice")
+                    else:
+                        tags.append("unpaid_invoice")
+            except Exception:
+                pass
 
             self.tree.insert(
                 "",
@@ -1485,6 +1584,7 @@ class PaymentsFrame(tb.Frame):
                     member,
                     op_type,
                     _fmt_money(amount, db=self.db),
+                    remaining_disp,
                     method,
                     received_by,
                     notes,
@@ -1619,7 +1719,8 @@ class PaymentsFrame(tb.Frame):
             "end_date": end,
             "payment_method": payment_method,
             "operation_type": self.filter_type_var.get(),
-            "search": self.filter_search_var.get().strip(),
+            "search": self.filter_search_var.get().strip() or None,
+            "show_paid": bool(self.filter_show_paid_var.get()),
         }
 
     def apply_filters(self) -> None:
@@ -1630,13 +1731,14 @@ class PaymentsFrame(tb.Frame):
         self.filter_method_var.set("الكل")
         self.filter_type_var.set("الكل")
         self.filter_search_var.set("")
+        self.filter_show_paid_var.set(True)
         try:
             self.start_entry.date = _month_start(date.today())
             self.end_entry.date = date.today()
         except Exception:
             pass
 
-        self.load_payments_data(filters=None)
+        self.load_payments_data(filters=self._collect_filters())
         self.load_financial_summary()
 
     def _safe_date(self, entry: DateEntry) -> str | None:
@@ -1840,7 +1942,13 @@ class PaymentsFrame(tb.Frame):
                            s.amount_paid AS paid,
                            s.end_date
                     FROM members m
-                    LEFT JOIN subscriptions s ON s.member_id = m.id AND s.status = 'active'
+                    LEFT JOIN subscriptions s ON s.id = (
+                        SELECT id
+                        FROM subscriptions
+                        WHERE member_id = m.id AND status = 'active'
+                        ORDER BY date(end_date) DESC, id DESC
+                        LIMIT 1
+                    )
                     LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
                     WHERE m.member_code LIKE ? OR m.phone LIKE ? OR m.first_name LIKE ? OR m.last_name LIKE ?
                     ORDER BY m.id DESC
@@ -1881,13 +1989,47 @@ class PaymentsFrame(tb.Frame):
             self.quick_amount_var.set(f"{bal:.0f}")
 
     def save_quick_payment(self) -> None:
+        if getattr(self, "_quick_saving", False):
+            return
+        self._quick_saving = True
+        try:
+            self.quick_btn_save.configure(state="disabled")
+        except Exception:
+            pass
+
         if self.db is None:
             messagebox.showerror("خطأ", "قاعدة البيانات غير جاهزة")
+            try:
+                self.quick_btn_save.configure(state="normal")
+            except Exception:
+                pass
+            self._quick_saving = False
             return
 
         if self.quick_selected_member is None:
             messagebox.showwarning("تنبيه", "يرجى اختيار عضو")
+            try:
+                self.quick_btn_save.configure(state="normal")
+            except Exception:
+                pass
+            self._quick_saving = False
             return
+
+        # Prevent extra receipts when the subscription is already fully paid.
+        try:
+            total = float(self.quick_selected_member.get("total") or 0)
+            paid = float(self.quick_selected_member.get("paid") or 0)
+            bal = max(0.0, total - paid)
+            if bal <= 0.01 and self.quick_selected_member.get("sub_id"):
+                messagebox.showwarning("تنبيه", "هذا الاشتراك مدفوع بالكامل ولا يوجد مبلغ مستحق")
+                try:
+                    self.quick_btn_save.configure(state="normal")
+                except Exception:
+                    pass
+                self._quick_saving = False
+                return
+        except Exception:
+            pass
 
         try:
             amount = float(self.quick_amount_var.get() or 0)
@@ -1896,6 +2038,11 @@ class PaymentsFrame(tb.Frame):
 
         if amount <= 0:
             messagebox.showwarning("تنبيه", "يرجى إدخال مبلغ صحيح")
+            try:
+                self.quick_btn_save.configure(state="normal")
+            except Exception:
+                pass
+            self._quick_saving = False
             return
 
         member_id = int(self.quick_selected_member["id"])
@@ -1911,6 +2058,11 @@ class PaymentsFrame(tb.Frame):
 
         if not ok:
             messagebox.showerror("خطأ", msg)
+            try:
+                self.quick_btn_save.configure(state="normal")
+            except Exception:
+                pass
+            self._quick_saving = False
             return
 
         messagebox.showinfo("تم", "تم تسجيل الدفعة بنجاح")
@@ -1922,6 +2074,12 @@ class PaymentsFrame(tb.Frame):
             data = self._get_payment_details(pid)
             if data:
                 ReceiptPreviewDialog(self.winfo_toplevel(), self.db, data).wait_window()
+
+        try:
+            self.quick_btn_save.configure(state="normal")
+        except Exception:
+            pass
+        self._quick_saving = False
 
     def _record_payment(
         self,
@@ -1935,13 +2093,49 @@ class PaymentsFrame(tb.Frame):
         """Record a payment and update linked subscription amount_paid."""
 
         try:
+            if float(amount) <= 0.01:
+                return False, "يرجى إدخال مبلغ صحيح", None
+        except Exception:
+            return False, "يرجى إدخال مبلغ صحيح", None
+
+        try:
             pay_date = payment_date or date.today().isoformat()
             now = datetime.now().strftime(config.DATETIME_FORMAT)
 
-            receipt = self.db.generate_receipt_number()
-
             with self.db.get_connection() as conn:
                 cur = conn.cursor()
+
+                if subscription_id is not None:
+                    try:
+                        row = cur.execute(
+                            """
+                            SELECT COALESCE(s.invoice_status, 'unpaid') AS invoice_status,
+                                   COALESCE(s.amount_paid, 0) AS paid,
+                                   COALESCE(st.price, 0) AS total
+                            FROM subscriptions s
+                            LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
+                            WHERE s.id = ?
+                            LIMIT 1
+                            """,
+                            (int(subscription_id),),
+                        ).fetchone()
+                        if row is not None:
+                            inv = str(row["invoice_status"] or "unpaid").strip().lower()
+                            total = float(row["total"] or 0)
+                            paid = float(row["paid"] or 0)
+                            remaining = max(0.0, total - paid)
+                            if inv == "paid" or remaining <= 0.01:
+                                return False, "هذه الفاتورة مدفوعة بالكامل ولا يمكن تسجيل دفعة أخرى", None
+                            if float(amount) > remaining + 0.01:
+                                return (
+                                    False,
+                                    f"المبلغ أكبر من المتبقي ({_fmt_money(float(remaining), db=self.db)})",
+                                    None,
+                                )
+                    except Exception:
+                        pass
+
+                receipt = self.db.generate_receipt_number()
 
                 cur.execute(
                     """
@@ -2367,7 +2561,13 @@ class RecordPaymentDialog(tk.Toplevel):
                            s.amount_paid AS paid,
                            s.end_date
                     FROM members m
-                    LEFT JOIN subscriptions s ON s.member_id = m.id AND s.status = 'active'
+                    LEFT JOIN subscriptions s ON s.id = (
+                        SELECT id
+                        FROM subscriptions
+                        WHERE member_id = m.id AND status = 'active'
+                        ORDER BY date(end_date) DESC, id DESC
+                        LIMIT 1
+                    )
                     LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
                     WHERE m.member_code LIKE ? OR m.phone LIKE ? OR m.first_name LIKE ? OR m.last_name LIKE ?
                     ORDER BY m.id DESC
@@ -2424,6 +2624,7 @@ class RecordPaymentDialog(tk.Toplevel):
                     SELECT receipt_number, payment_date, amount
                     FROM payments
                     WHERE member_id = ?
+                      AND ABS(COALESCE(amount, 0)) > 0.01
                     ORDER BY datetime(created_at) DESC, id DESC
                     LIMIT 5
                     """,
@@ -2493,6 +2694,51 @@ class RecordPaymentDialog(tk.Toplevel):
 
             with self.db.get_connection() as conn:
                 cur = conn.cursor()
+
+                if sub_id:
+                    try:
+                        row = cur.execute(
+                            """
+                            SELECT COALESCE(s.invoice_status, 'unpaid') AS invoice_status,
+                                   COALESCE(s.amount_paid, 0) AS paid,
+                                   COALESCE(st.price, 0) AS total
+                            FROM subscriptions s
+                            LEFT JOIN subscription_types st ON st.id = s.subscription_type_id
+                            WHERE s.id = ?
+                            LIMIT 1
+                            """,
+                            (int(sub_id),),
+                        ).fetchone()
+                        if row is not None:
+                            inv = str(row["invoice_status"] or "unpaid").strip().lower()
+                            total = float(row["total"] or 0)
+                            paid0 = float(row["paid"] or 0)
+                            remaining0 = max(0.0, total - paid0)
+                            if inv == "paid" or remaining0 <= 0.01:
+                                Messagebox.ok(title="تنبيه", message="هذا الاشتراك مدفوع بالكامل ولا يوجد مبلغ مستحق", parent=self)
+                                try:
+                                    self.btn_save.configure(state="normal")
+                                    self.btn_save_print.configure(state="normal")
+                                except Exception:
+                                    pass
+                                self._saving = False
+                                return
+                            if float(amount) > remaining0 + 0.01:
+                                Messagebox.ok(
+                                    title="خطأ",
+                                    message=f"المبلغ أكبر من المتبقي ({_fmt_money(float(remaining0), db=self.db)})",
+                                    parent=self,
+                                )
+                                try:
+                                    self.btn_save.configure(state="normal")
+                                    self.btn_save_print.configure(state="normal")
+                                except Exception:
+                                    pass
+                                self._saving = False
+                                return
+                    except Exception:
+                        pass
+
                 cur.execute(
                     """
                     INSERT INTO payments
@@ -2562,7 +2808,7 @@ class RecordPaymentDialog(tk.Toplevel):
                         (pid,),
                     ).fetchone()
                 if data:
-                    ReceiptPreviewDialog(self, dict(data)).wait_window()
+                    ReceiptPreviewDialog(self, self.db, dict(data)).wait_window()
 
             self.destroy()
         except Exception as e:

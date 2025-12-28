@@ -60,6 +60,11 @@ except Exception:
     ReportsFrame = None  # type: ignore
 
 try:
+    from smart_reports_frame import SmartReportsFrame  # type: ignore
+except Exception:
+    SmartReportsFrame = None  # type: ignore
+
+try:
     from settings_frame import SettingsFrame  # type: ignore
 except Exception:
     SettingsFrame = None  # type: ignore
@@ -592,6 +597,7 @@ class MainWindow:
         self._add_menu_item("payments", "المدفوعات", "💰")
         self._add_menu_item("plans", "الباقات", "🧾")
         self._add_menu_item("reports", "التقارير", "📊")
+        self._add_menu_item("smart_reports", "التقارير الذكية", "🧠")
 
         tb.Separator(self.menu_container).pack(fill="x", pady=12)
 
@@ -674,6 +680,7 @@ class MainWindow:
             ("payments", "المدفوعات", "💰"),
             ("plans", "الباقات", "🧾"),
             ("reports", "التقارير", "📊"),
+            ("smart_reports", "التقارير الذكية", "🧠"),
             ("settings", "الإعدادات", "⚙️"),
             ("about", "حول البرنامج", "ℹ️"),
         ]
@@ -813,6 +820,8 @@ class MainWindow:
             frame = PlansFrame(host, self.db, self.user_data)  # type: ignore
         elif frame_name == "reports" and ReportsFrame is not None:
             frame = ReportsFrame(host, self.db, self.user_data)  # type: ignore
+        elif frame_name == "smart_reports" and SmartReportsFrame is not None:
+            frame = SmartReportsFrame(host, self.db, self.user_data)  # type: ignore
         elif frame_name == "settings" and SettingsFrame is not None:
             frame = SettingsFrame(host, self.db, self.user_data)  # type: ignore
         elif frame_name == "about":
