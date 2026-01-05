@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDEs
+.idea/
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# App runtime data
+exports/
+backups/
+
+# Local database folders/files
+database/*.db
+*.db
+
+# Project current DB location
+/data/*.db
+/data/backups/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Executables
+*.exe
